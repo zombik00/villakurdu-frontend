@@ -1,0 +1,93 @@
+name: Deploy to Staging
+run-name: "Staging: ${{ github.event.head_commit.message }}"
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-staging-frontend
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: CI Checks
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: ci
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build for staging
+        run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: https://staging-api.villakurdu.com/api/v1
+          NEXT_PUBLIC_APP_URL: https://staging.villakurdu.com
+
+      - name: Package standalone build
+        run: |
+          cp -r public .next/standalone/public
+          cp -r .next/static .next/standalone/.next/static
+          tar -czf deploy-staging.tar.gz -C .next/standalone .
+
+      - name: Copy build to staging server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          source: "deploy-staging.tar.gz"
+          target: "/opt/villakurdu-frontend"
+
+      - name: Deploy and restart
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          script: |
+            set -e
+            cd /opt/villakurdu-frontend
+
+            echo "==> Stopping frontend..."
+            pm2 delete villakurdu-frontend 2>/dev/null || true
+
+            echo "==> Extracting standalone build..."
+            rm -rf standalone
+            mkdir -p standalone
+            tar -xzf deploy-staging.tar.gz -C standalone
+            rm deploy-staging.tar.gz
+
+            echo "==> Starting frontend..."
+            cd standalone
+            HOSTNAME=0.0.0.0 PORT=3000 NODE_ENV=production pm2 start server.js --name villakurdu-frontend
+            pm2 save
+
+            echo "==> Deployment complete!"
+
+      - name: Health check
+        run: |
+          for i in 1 2 3 4 5; do
+            sleep 5
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://staging.villakurdu.com) || true
+            echo "Attempt $i: HTTP $STATUS"
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed!"
+              exit 0
+            fi
+          done
+          echo "Health check failed after 5 attempts"
+          exit 1
